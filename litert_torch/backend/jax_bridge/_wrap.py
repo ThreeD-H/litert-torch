@@ -147,6 +147,8 @@ def wrap(jaxfn: Callable[Any, Any], ir_input_names: list[str] = None):
         builtin.module(
             vhlo-legalize-stablehlo,
             reconcile-unrealized-casts,
+            func.func(stablehlo-legalize-composite-to-call),
+            inline,
             strip-debuginfo
         )""")).run(module.operation)
 
