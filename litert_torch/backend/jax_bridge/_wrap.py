@@ -14,6 +14,7 @@
 # ==============================================================================
 """APIs to wrap JAX functions for using in ODML Torch lowerings."""
 
+import dataclasses
 import functools
 import inspect
 import textwrap
@@ -22,6 +23,7 @@ import uuid
 import jax
 from litert_torch.backend import export_utils
 from litert_torch.backend.jax_bridge import utils
+from litert_torch.backend.lowerings import context as lowerings_context
 from ai_edge_litert.mlir import ir
 from ai_edge_litert.mlir import passmanager
 from ai_edge_litert.mlir.dialects import func
@@ -43,9 +45,62 @@ from jaxlib._jax.mlir import serialize_portable_artifact
 jax.config.update("jax_enable_x64", True)
 
 
+def get_cache_fingerprint(*args: Any, **kwargs: Any) -> int:
+
+  def _extract(item: Any) -> Any:
+    if isinstance(item, ir.Value):
+      arr = utils.ir_variable_to_jax(item)
+      return (arr.shape, arr.dtype)
+
+    elif isinstance(item, (list, tuple)):
+      return tuple(_extract(i) for i in item)
+
+    elif isinstance(item, dict):
+      return tuple((k, _extract(item[k])) for k in sorted(item.keys()))
+
+    return item
+
+  fingerprint = (_extract(args), _extract(kwargs))
+
+  try:
+    hash(fingerprint)
+    return fingerprint
+  except TypeError:
+    # fingerprint is not hashable
+    return None
+
+
+@dataclasses.dataclass
+class JaxBridgeLoweringCache(lowerings_context.LoweringContextPlugin):
+  cache: dict[Any, func.FuncOp] = dataclasses.field(default_factory=dict)
+
+  def get_func_op(self, identifier) -> func.FuncOp:
+    fp = get_cache_fingerprint(identifier)
+    if fp is None:
+      return None
+    return self.cache.get(fp, None)
+
+  def set_func_op(self, identifier, func_op: func.FuncOp):
+    fp = get_cache_fingerprint(identifier)
+    if fp is None:
+      return
+    self.cache[fp] = func_op
+
+  @classmethod
+  def get(
+      cls, lctx: lowerings_context.LoweringContext
+  ) -> "JaxBridgeLoweringCache":
+    if not lctx.has_plugin(cls):
+      lctx.add_plugin(cls())
+    return lctx.get_plugin(cls)
+
+
 def _lower_to_ir_text(
-    jaxfn, args, kwargs, ir_input_names: list[str] | None = None
-) -> tuple[str, list[ir.Value]]:
+    jaxfn,
+    args,
+    kwargs,
+    ir_input_names: list[str] | None = None,
+) -> tuple[Callable[[], str], list[ir.Value]]:
   """Lower the JAX function to IR text and collect the IR inputs."""
   args = utils.tree_map_list_to_tuple(args)
   kwargs = utils.tree_map_list_to_tuple(kwargs)
@@ -98,7 +153,10 @@ def _lower_to_ir_text(
 
     return jaxfn(*jaxfn_args, **jaxfn_kwargs)
 
-  return jax.jit(lower_wrapper).lower(*jax_lower_args).as_text(), ir_inputs
+  ir_text_getter = (
+      lambda: jax.jit(lower_wrapper).lower(*jax_lower_args).as_text()
+  )
+  return ir_text_getter, ir_inputs
 
 
 def _stablehlo_to_vhlo(ir_text: str) -> bytes:
@@ -133,47 +191,56 @@ def wrap(jaxfn: Callable[Any, Any], ir_input_names: list[str] = None):
 
   @functools.wraps(jaxfn)
   def wrapped(lctx, *args, **kwargs):
-
-    ir_text, ir_inputs = _lower_to_ir_text(
+    jlcache = JaxBridgeLoweringCache.get(lctx)
+    identifier = (jaxfn, args, kwargs, ir_input_names)
+    ir_text_getter, ir_inputs = _lower_to_ir_text(
         jaxfn,
         args,
         kwargs,
         ir_input_names=ir_input_names,
     )
-    vhlo_bytecode = _stablehlo_to_vhlo(ir_text)
 
-    module = ir.Module.parse(vhlo_bytecode)
-    passmanager.PassManager.parse(textwrap.dedent("""\
-        builtin.module(
-            vhlo-legalize-stablehlo,
-            reconcile-unrealized-casts,
-            func.func(stablehlo-legalize-composite-to-call),
-            inline,
-            strip-debuginfo
-        )""")).run(module.operation)
+    func_op = jlcache.get_func_op(identifier)
+    if func_op is None:
+      ir_text = ir_text_getter()
+      del ir_text_getter
 
-    symbol_table = ir.SymbolTable(module.operation)
-    main_func = symbol_table["main"]
+      vhlo_bytecode = _stablehlo_to_vhlo(ir_text)
 
-    with ir.InsertionPoint.at_block_begin(lctx.ir_module.body):
-      cloned_func = cast(func.FuncOp, main_func.clone())
-      cloned_func_name = f"{jaxfn.__name__}_{uuid.uuid4().hex[:8]}"
-      cloned_func.attributes["sym_name"] = ir.StringAttr.get(cloned_func_name)
-      cloned_func.attributes["sym_visibility"] = ir.StringAttr.get("private")
+      module = ir.Module.parse(vhlo_bytecode)
+      passmanager.PassManager.parse(textwrap.dedent("""\
+          builtin.module(
+              vhlo-legalize-stablehlo,
+              reconcile-unrealized-casts,
+              func.func(stablehlo-legalize-composite-to-call),
+              inline,
+              strip-debuginfo
+          )""")).run(module.operation)
 
-    # HACK: Use the custom inliner implemented in Python because MLIR inline
-    # pass from JAX's MLIR pybinding build in OSS cannot properly inline
-    # func.call ops.
-    # This should be switched to `passes.inline(module)` when we have our own
-    # MLIR pybinding build.
-    export_utils.inline(symbol_table, cloned_func.entry_block)
+      symbol_table = ir.SymbolTable(module.operation)
+      main_func = symbol_table["main"]
 
-    if not cloned_func.arguments:
+      with ir.InsertionPoint.at_block_begin(lctx.ir_module.body):
+        cloned_func = cast(func.FuncOp, main_func.clone())
+        cloned_func_name = f"{jaxfn.__name__}_{uuid.uuid4().hex[:8]}"
+        cloned_func.attributes["sym_name"] = ir.StringAttr.get(cloned_func_name)
+        cloned_func.attributes["sym_visibility"] = ir.StringAttr.get("private")
+
+      # HACK: Use the custom inliner implemented in Python because MLIR inline
+      # pass from JAX's MLIR pybinding build in OSS cannot properly inline
+      # func.call ops.
+      # This should be switched to `passes.inline(module)` when we have our own
+      # MLIR pybinding build.
+      export_utils.inline(symbol_table, cloned_func.entry_block)
+
+      func_op = cloned_func
+      jlcache.set_func_op(identifier, func_op)
+
+    if not func_op.arguments:
       # Known edge case: when the lowering does not depend on input but
       # just the meta of input like shape or dtype.
       ir_inputs = []
-
-    results = func.CallOp(cloned_func, ir_inputs).results
+    results = func.CallOp(func_op, ir_inputs).results
 
     if lctx.node is None:
       return results[0] if len(results) == 1 else results
