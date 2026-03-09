@@ -15,10 +15,16 @@
 """Exportable modules."""
 
 import dataclasses
+import enum
 import pprint
 from typing import Any
 
 import torch
+
+
+class ExportTask(str, enum.Enum):
+  TEXT_GENERATION = "text_generation"
+  IMAGE_TEXT_TO_TEXT = "image_text_to_text"
 
 
 @dataclasses.dataclass
@@ -27,7 +33,7 @@ class ExportableModuleConfig:
 
   model: str
   output_dir: str | None = None
-  task: str = "text_generation"
+  task: ExportTask | str = ExportTask.TEXT_GENERATION
   keep_temporary_files: bool = False
   trust_remote_code: bool = False
   prefill_lengths: list[int] = dataclasses.field(default_factory=lambda: [256])
@@ -76,7 +82,7 @@ class ExportableModuleConfig:
         self.cache_implementation = "LiteRTLMSplitCache"
 
     match self.task:
-      case "image_text_to_text":
+      case ExportTask.IMAGE_TEXT_TO_TEXT:
         if self.export_vision_encoder:
           self.externalize_embedder = True
       case _:
