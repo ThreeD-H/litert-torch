@@ -89,19 +89,15 @@ setup(
         "transformers",
         "kagglehub",
         "tabulate",
-        "torch>=2.4.0,<2.10.0",
-        "ai-edge-litert-nightly==2.2.0.dev20260210",  # with converter
+        "torch>=2.4.0",
+        "ai-edge-litert-nightly==2.2.0.dev20260316",  # with converter
         "ai-edge-quantizer-nightly",
         "torchao",
         "jax",
-        "torch-xla2[odml]>=0.0.1.dev20241201",
         "jaxtyping",
         "fire",
         "sentencepiece",
     ],
-    extras_require={
-        "torch-xla": ["torch_xla>=2.4.0"],
-    },
     entry_points={
         "console_scripts": [
             "litert-torch = litert_torch.cli:main",

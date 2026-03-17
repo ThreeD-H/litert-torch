@@ -1,13 +1,12 @@
 absl-py
-torch==2.9.0
-torchvision==0.24.0
-torchaudio==2.9.0
+torch==2.10.0
+torchvision==0.25.0
+torchaudio==2.10.0
 torchao
 --pre
-ai-edge-litert-nightly==2.2.0.dev20260210
+ai-edge-litert-nightly==2.2.0.dev20260316
 ai-edge-quantizer-nightly
 jax[cpu]
-torch-xla2[odml]>=0.0.1.dev20241201
 scipy
 numpy
 tabulate

@@ -73,11 +73,7 @@ def rnd(dtype, shape, min_v=None, max_v=None):
 
 
 class TestCoreAtenOps(parameterized.TestCase):
-  """Test core aten ops lowering and validation.
-
-  Source:
-  https://github.com/pytorch/xla/blob/master/experimental/torch_xla2/test/test_core_aten_ops.py
-  """
+  """Test core aten ops lowering and validation."""
 
   def setUp(self):
     super().setUp()
