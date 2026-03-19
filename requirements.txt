@@ -4,7 +4,7 @@ torchvision==0.25.0
 torchaudio==2.10.0
 torchao
 --pre
-ai-edge-litert-nightly==2.2.0.dev20260316
+ai-edge-litert-nightly[model-utils]==2.2.0.dev20260319
 ai-edge-quantizer-nightly
 jax[cpu]
 scipy
@@ -16,3 +16,4 @@ transformers
 multipledispatch
 jaxtyping
 fire
+rich

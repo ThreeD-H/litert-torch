@@ -110,6 +110,7 @@ def exported_programs_to_flatbuffer(
     quant_config: qcfg.QuantConfig | None = None,
     lightweight_conversion: bool = False,
     enable_x64: bool = True,
+    runtime_constant_folding: bool | None = None,
 ) -> LazyModelExporter:
   """Convert ExportedPrograms to a LiteRT model."""
   if not exported_programs:
@@ -188,6 +189,18 @@ def exported_programs_to_flatbuffer(
     converter_api_ext.run_convert_to_tfl_passes(
         merged_module, pass_manager, config
     )
+
+  # Use runtime folding if lightweight conversion is enabled to compensate for
+  # the loss of constant folding with DenseResourceElementsAttr.
+  if runtime_constant_folding is None:
+    runtime_constant_folding = lightweight_conversion
+
+  if runtime_constant_folding:
+    with progress.task("LiteRT Runtime Constant Folding"):
+      # pylint: disable=g-import-not-at-top
+      from litert_torch._convert import runtime_fold
+      # pylint: enable=g-import-not-at-top
+      runtime_fold.runtime_fold(ir_context, merged_module)
 
   # Creates the lazy flatbuffer exporter.
   exporter = LazyModelExporter(module=merged_module)

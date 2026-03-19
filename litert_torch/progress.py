@@ -67,6 +67,15 @@ def _stack_elapsed_time() -> str:
   return f"[dim default]({_fmt_elapsed_time(elapsed)})[/dim default]"
 
 
+def log(message: str):
+  """Log a message."""
+  if not config.show_progress:
+    return
+  console.print(
+      f"{_stack_elapsed_time()} [bold blue][ INFO][/bold blue] {message}"
+  )
+
+
 @contextlib.contextmanager
 def task(name: str) -> Generator[None, None, None]:
   """Context manager for tracking one task."""

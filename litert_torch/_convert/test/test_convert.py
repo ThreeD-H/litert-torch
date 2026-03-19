@@ -621,6 +621,38 @@ class TestConvert(googletest.TestCase):
         atol=1e-4,
     )
 
+  def test_convert_model_with_runtime_folding(self):
+    """Test converting a simple model with runtime folding."""
+
+    class SampleModel(nn.Module):
+
+      def __init__(self):
+        super().__init__()
+        self.weights = [torch.randn(32 * 1024 * 1024) for _ in range(6)]
+
+      def forward(self, x):
+        for w1, w2 in zip(self.weights, self.weights[1:]):
+          x = torch.sin(x * (torch.sin(w1) + torch.cos(w2)))
+        return x
+
+    model = SampleModel().eval()
+    args = (torch.randn(1),)
+    try:
+      em = litert_torch.convert(
+          model,
+          args,
+          lightweight_conversion=True,
+          runtime_constant_folding=True,
+      )
+    except Exception as err:
+      self.fail(f"Conversion failed with runtime constant folding: {err}")
+
+    np.testing.assert_allclose(
+        em(args[0]),
+        model(args[0]).detach().numpy(),
+        atol=1e-4,
+    )
+
   def test_compile_model(self):
     """Tests AOT compilation of a simple Add module."""
 
