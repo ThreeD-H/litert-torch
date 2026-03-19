@@ -23,7 +23,10 @@ from litert_torch._convert import signature as signature_module
 from litert_torch.quantize import quant_config as qcfg
 import torch
 
-from ai_edge_litert.aot.core import types as litert_types
+try:
+  from ai_edge_litert.aot.core import aot_types as litert_types
+except ImportError:
+  from ai_edge_litert.aot.core import types as litert_types
 from ai_edge_litert.aot.vendors import import_vendor as vendor_lib
 
 

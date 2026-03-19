@@ -27,7 +27,10 @@ from torchao.quantization.pt2e import quantize_pt2e
 import torchvision
 
 from absl.testing import absltest as googletest
-from ai_edge_litert.aot.core import types as litert_types
+try:
+  from ai_edge_litert.aot.core import aot_types as litert_types
+except ImportError:
+  from ai_edge_litert.aot.core import types as litert_types
 from ai_edge_litert.aot.vendors import fallback_backend
 from ai_edge_litert import interpreter as tfl_interpreter  # pylint: disable=g-direct-tensorflow-import
 
