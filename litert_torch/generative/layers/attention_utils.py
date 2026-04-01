@@ -110,7 +110,16 @@ def build_rope_cache(
   """
   if device is None:
     device = torch.device('cpu')
-  theta = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+  #theta = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+  # Avoid `aten.pow.Scalar` in exported graphs:
+  # `base` is a Python scalar while the exponent is a Tensor, which results in
+  # `aten.pow.Scalar` (scalar base ** tensor exponent). Qualcomm partitioner
+  # may not have a visitor for it. Make `base` a Tensor so we get a tensor
+  # pow variant instead.
+  # theta = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+  exponent = torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim
+  base_tensor = torch.tensor(float(base), device=device, dtype=torch.float32)
+  theta = 1.0 / torch.pow(base_tensor, exponent)
   seq_idx = torch.arange(size) / condense_ratio
   idx_theta = torch.outer(seq_idx, theta)
   cos = torch.cos(idx_theta).to(dtype=dtype, device=device)

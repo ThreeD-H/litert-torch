@@ -246,7 +246,8 @@ def verify_with_input_ids(
   outputs_reauthored = reauthored_model.forward(tokens)
   logits_reauthored = outputs_reauthored[0, len(input_ids) - 1, :]
   logging.info("logits_reauthored: %s", logits_reauthored)
-
+  logits_original = logits_original.float()
+  logits_reauthored = logits_reauthored.float()
   assert torch.allclose(
       logits_original, logits_reauthored, rtol=rtol, atol=atol
   )

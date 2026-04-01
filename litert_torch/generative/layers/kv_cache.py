@@ -31,6 +31,21 @@ KVLayout = Tuple[types.TensorDimensionMeta, types.TensorDimensionMeta]
 KV_LAYOUT_DEFAULT = (types.BTNH, types.BTNH)
 KV_LAYOUT_TRANSPOSED = (types.BNTH, types.BNHT)
 
+def _serialize_kv_layout(kv_layout: KVLayout) -> List[str]:
+  """Serialize KV layout for pytree context JSON encoding.
+
+  Executorch (via torch pytree) JSON-serializes `ExportedProgram.call_spec`
+  input specs. Python class objects like `TensorDimensionMeta` are not JSON
+  serializable, so we store only their names.
+  """
+  # NOTE: `types.BTNH` / `types.BNTH` etc are classes created by
+  # `TensorDimensionMeta` metaclass; their `__name__` is stable.
+  return [kv_layout[0].__name__, kv_layout[1].__name__]
+
+
+def _deserialize_kv_layout(serialized: List[str] | Tuple[str, str]) -> KVLayout:
+  """Inverse of `_serialize_kv_layout()`."""
+  return (getattr(types, serialized[0]), getattr(types, serialized[1]))
 
 @dataclasses.dataclass
 class KVCacheEntry:
@@ -155,7 +170,7 @@ class KVCache:
 def _flatten_kvc(kvc: KVCache) -> Tuple[List[str], List[str]]:
   flattened = []
   flat_names = []
-  none_names = [kvc.caches[0].kv_layout]
+  none_names = [_serialize_kv_layout(kvc.caches[0].kv_layout)]
   for i, kv_entry in enumerate(kvc.caches):
     flattened.append(kv_entry.k_cache)
     flat_names.append(f"k_{i}")
@@ -178,7 +193,7 @@ def _unflatten_kvc(
   assert len(values) % 2 == 0, "Found odd number of K and V entries."
   num_layers = len(values) // 2
   flat_names = context[0]
-  kv_layout = context[1][0]
+  kv_layout = _deserialize_kv_layout(context[1][0])
   kv_entries = []
   for i in range(num_layers):
     k_cache_idx = flat_names.index(f"k_{i}")
@@ -197,14 +212,18 @@ def _unflatten_kvc(
 def _flatten_kv_entry(
     kv_e: KVCacheEntry,
 ) -> Tuple[List[torch.Tensor], Any]:
-  return ([kv_e.k_cache, kv_e.v_cache], kv_e.kv_layout)
+    # Return a JSON-serializable context.
+    return (
+        [kv_e.k_cache, kv_e.v_cache],
+        _serialize_kv_layout(kv_e.kv_layout),
+    )
 
 
 def _unflatten_kv_entry(
     values: List[torch.Tensor],
     context: Any,
 ) -> KVCacheEntry:
-  return KVCacheEntry(*values, kv_layout=context)
+  return KVCacheEntry(*values, kv_layout=_deserialize_kv_layout(context))
 
 
 pytree.register_pytree_node(
@@ -228,7 +247,7 @@ def update(
     input_pos: torch.Tensor,
     k_slice: torch.Tensor,
     v_slice: torch.Tensor,
-    use_dus: bool = True,
+    use_dus: bool = False,
 ) -> KVCacheEntry:
   """Out of place update of Cache buffer.
 

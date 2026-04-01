@@ -60,9 +60,11 @@ def build_rope(
     return None, None
 
   freq_exponents = (2.0 / n_elem) * torch.arange(
-      n_elem // 2, dtype=torch.float32
+      n_elem // 2, dtype=torch.float32, device=input_pos.device
   )
-  timescale = float(base) ** freq_exponents
+  # Avoid `aten.pow.Scalar` in exported graphs (scalar base ** tensor exponent).
+  base_tensor = torch.tensor(float(base), device=freq_exponents.device, dtype=freq_exponents.dtype)
+  timescale = torch.pow(base_tensor, freq_exponents)
   radians = input_pos.clone().unsqueeze(0).unsqueeze(-1) / timescale.unsqueeze(
       0
   ).unsqueeze(0)

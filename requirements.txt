@@ -1,11 +1,11 @@
 absl-py
-torch==2.10.0
-torchvision==0.25.0
-torchaudio==2.10.0
+torch==2.9.0
+torchvision==0.24.0
+torchaudio==2.9.0
 torchao
---pre
-ai-edge-litert-nightly[model-utils]==2.2.0.dev20260319
-ai-edge-quantizer-nightly==0.5.1.dev20260319
+#--pre
+#ai-edge-litert-nightly[model-utils]==2.2.0.dev20260319
+#ai-edge-quantizer-nightly==0.5.1.dev20260319
 jax[cpu]
 scipy
 numpy

@@ -23,7 +23,7 @@ from litert_torch.generative.examples.qwen import verify_util
 
 _MODEL_SIZE = flags.DEFINE_enum(
     "model_size",
-    "3b",
+    "0.5b",
     ["0.5b", "1.5b", "3b"],
     "The size of the model to verify.",
 )

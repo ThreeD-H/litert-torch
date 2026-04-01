@@ -66,7 +66,7 @@ class NormalizationConfig:
   """Normalizater parameters."""
 
   type: NormalizationType = NormalizationType.NONE
-  enable_hlfb: bool = True
+  enable_hlfb: bool = False
   epsilon: float = 1e-5
   zero_centered: bool = False
   # Whether to use a scale parameter in the normalization.
@@ -254,7 +254,7 @@ class ModelConfig:
   dense_intermediate_size: Optional[int] = None
 
   # Whether to turn on high-level function boundary.
-  enable_hlfb: bool = True
+  enable_hlfb: bool = False
 
   # Softcap on the model output logits.
   final_logit_softcap: Optional[float] = None
