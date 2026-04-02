@@ -20,6 +20,8 @@ import os
 import pathlib
 import tempfile
 from typing import Callable, Dict, Optional, Union
+
+import transformers
 from absl import flags
 from litert_torch._convert import interface as converter_utils
 from litert_torch.generative.layers import kv_cache as kv_utils
@@ -91,9 +93,9 @@ def define_conversion_flags(
         f'{model_name}',
         'The prefix of the output tflite model name.',
     )
-    flags.DEFINE_multi_integer(
-        'prefill_seq_lens',
-        (8, 64, 128, 256, 512, 1024),
+    flags.DEFINE_integer(
+        'prefill_seq_len',
+        64,
         'List of the maximum sizes of prefill input tensors.',
     )
     flags.DEFINE_integer(
@@ -103,14 +105,14 @@ def define_conversion_flags(
     )
     flags.DEFINE_integer(
         'kv_cache_max_len',
-        1280,
+        512,
         'The maximum size of KV cache buffer, including both prefill and decode.',
     )
-    flags.DEFINE_string(
-        'quantize',
-        'dynamic_int8',
+    flags.DEFINE_bool(
+        'use_quantize',
+        False,
         'How the model should be quantized. Set to "none" to disable '
-        'quantization. See `QuantizationName` for supported quantization types.',
+        'quantization. See `QuantDtype` for supported quantization types.',
     )
     flags.DEFINE_multi_integer(
         'lora_ranks',
@@ -150,11 +152,11 @@ def define_conversion_flags(
         'If true, the conversion script will export signatures used only for '
         'verification of GPU dynamic shapes.',
     )
-    flags.DEFINE_multi_string(
-        'backends',
-        'cpu,qnn',
+    flags.DEFINE_string(
+        'backend',
+        'qnn',
         'How the model use backends '
-        'backends：cpu,qnn',
+        'backend：cpu,qnn',
     )
     return flags
 
@@ -552,13 +554,28 @@ def _add_signatures(
         )
 
 
+from executorch.backends.qualcomm.quantizer.quantizer import QnnQuantizer, QuantDtype
+from executorch.backends.qualcomm.serialization.qc_schema import QcomChipset
+from executorch.backends.qualcomm.utils.utils import generate_htp_compiler_spec, generate_qnn_executorch_compiler_spec, \
+    to_edge_transform_and_lower_to_qnn
+from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
+from executorch.exir import to_edge_transform_and_lower
+from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e, convert_pt2e
+from executorch.runtime import Runtime
+
+
 def build_and_convert_to_pte_from_flags(model_builder: Callable[
     [str, Callable[[str], Dict[str, torch.Tensor]], int], torch.nn.Module
 ],
                                         checkpoint_path: str = None,
                                         output_name_prefix: str = None,
                                         export_config: ExportConfig = None):
-    backends = flags.FLAGS.backends
+    if export_config is None:
+        export_config = ExportConfig()
+        export_config.output_logits_on_prefill = True
+        export_config.mask_as_input = True
+    backend = flags.FLAGS.backend
+    quantize = flags.FLAGS.use_quantize
     if checkpoint_path is None:
         checkpoint_path = flags.FLAGS.checkpoint_path
     if output_name_prefix is None:
@@ -573,12 +590,211 @@ def build_and_convert_to_pte_from_flags(model_builder: Callable[
         ),
         get_mask_cache_size_from_flags(),
     )
-    prefill_seq_lens = flags.FLAGS.prefill_seq_lens
+    prefill_seq_len = flags.FLAGS.prefill_seq_len
     kv_cache_max_len = flags.FLAGS.kv_cache_max_len
+    print(
+        f"backend = {backend}, quantize = {quantize}, prefill_seq_len = {prefill_seq_len}, kv_cache_max_len = {kv_cache_max_len}")
     config = pytorch_model.config
     prefill_kv = kv_utils.KVCache.from_model_config(
         kv_cache_max_len, config, kv_layout=export_config.kvcache_layout
     )
+    mod = ExportableModule(pytorch_model, export_config=export_config).eval()
+    prefill_masks = None
+    if export_config.mask_as_input:
+        prefill_masks = _build_mask(
+            prefill_seq_len, kv_cache_max_len, config.causal_mask_value
+        )
+    sample_kwargs = {
+        'tokens': torch.full((1, prefill_seq_len), 0, dtype=torch.int),
+        'input_pos': torch.arange(0, prefill_seq_len, dtype=torch.int),
+        'kv_cache': prefill_kv,
+    }
+    if prefill_masks is not None:
+        sample_kwargs['mask'] = prefill_masks
+    print(f"示例输入创建完毕~ sample_kwargs = {sample_kwargs}")
+    backend_options = generate_htp_compiler_spec(
+        use_fp16=True if not quantize else False,
+        use_multi_contexts=False,
+        use_weight_sharing=False
+    )
+    compile_spec = generate_qnn_executorch_compiler_spec(
+        soc_model=QcomChipset.SA8295,
+        backend_options=backend_options,
+        shared_buffer=True
+    )
+    if quantize:
+        print(f"开始导出ExportedProgram...")
+        exported_program = torch.export.export(mod, args=tuple(), kwargs=sample_kwargs, dynamic_shapes=None)
+        print(f"ExportedProgram导出完毕~")
+        quantizer = QnnQuantizer()
+        quantizer.set_default_quant_config(
+            quant_dtype=QuantDtype.use_16a8w,
+            is_qat=False,
+            is_conv_per_channel=False,
+            is_linear_per_channel=False
+        )
+        print(f"prepare_pt2e...")
+        prepared_model = prepare_pt2e(exported_program.module(), quantizer)
+        prepared_model(**sample_kwargs)
+        print(f"convert_pt2e...")
+        quantized_model = convert_pt2e(prepared_model)
+        print(f"量化完毕~")
+        sample_inputs = (
+            sample_kwargs["tokens"],
+            sample_kwargs["input_pos"],
+            sample_kwargs["kv_cache"],
+        )
+        if prefill_masks is not None:
+            sample_inputs = (*sample_inputs, sample_kwargs["mask"])
+
+        program = to_edge_transform_and_lower_to_qnn(
+            quantized_model,
+            compiler_specs=compile_spec,
+            args=sample_inputs,
+            skip_mutable_buffer=True
+        ).to_executorch()
+    else:
+        if 'qnn' == backend:
+            program = to_edge_transform_and_lower_to_qnn(
+                mod,
+                compiler_specs=compile_spec,
+                inputs=sample_kwargs,
+                skip_mutable_buffer=True
+            ).to_executorch()
+        else:
+            print(f"开始导出ExportedProgram...")
+            exported_program = torch.export.export(mod, args=tuple(), kwargs=sample_kwargs, dynamic_shapes=None)
+            print(f"ExportedProgram导出完毕~")
+            program = to_edge_transform_and_lower(
+                exported_program,
+                partitioner=[XnnpackPartitioner()]
+            ).to_executorch()
+    file_name = f"{output_name_prefix}.pte" if output_name_prefix is not None else f"model_{backend}.pte"
+    with open(file_name, "wb") as f:
+        f.write(program.buffer)
+    print(f"ExportedProgram转换和 lowers完毕~")
+    if backend == 'cpu':
+        print(f"开始验证edge模型")
+        runtime = Runtime.get()
+        method = runtime.load_program(file_name).load_method("forward")
+
+        tokenizer = transformers.AutoTokenizer.from_pretrained(checkpoint_path)
+        prompt = "你是谁"
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        model_inputs = tokenizer([text], return_tensors="pt").to("cpu")
+        tokens = model_inputs["input_ids"]
+        tokens = torch.nn.functional.pad(tokens, (0, prefill_seq_len - tokens.size(-1)), "constant",
+                                         tokenizer.pad_token_id)
+        input_pos = torch.arange(0, prefill_seq_len, dtype=torch.int)
+        actual_seq_len = model_inputs["input_ids"].size(-1)
+        prefill_masks = create_causal_mask(actual_seq_len, kv_cache_max_len, prefill_seq_len)
+        print(f"tokens={tokens}, input_pos={input_pos}, prefill_kv={prefill_kv}, prefill_masks={prefill_masks}")
+        flattened_kv_cache = prefill_kv.flatten()
+        inputs = [tokens.int(), input_pos] + flattened_kv_cache + [prefill_masks]
+        outputs = method.execute(inputs)
+        logits = outputs[0]
+        last_real_pos = int(actual_seq_len) - 1
+        next_token_logits = logits[:, last_real_pos:last_real_pos + 1, :]
+        next_token = next_token_logits.argmax(dim=-1)
+        next_token_ids = next_token.squeeze(0).tolist()
+        print(f"actual_seq_len={actual_seq_len}, last_real_pos={last_real_pos}, next_token_ids={next_token_ids}")
+        wrapper_text = tokenizer.decode(next_token_ids, skip_special_tokens=True)
+        print(f"edge模型验证完毕~ wrapper_text={wrapper_text}")
+        visualize_mask(prefill_masks, actual_seq_len)
+    return file_name
+
+
+def create_causal_mask(actual_seq_len, kv_cache_max_len, mask_len):
+    """
+    创建因果掩码矩阵
+
+    Args:
+        actual_seq_len: 真实序列长度（键的有效长度）
+        kv_cache_max_len: KV缓存最大长度
+        mask_len: 掩码序列长度
+
+    Returns:
+        mask: 形状为 [1, 1, mask_len, kv_cache_max_len] 的掩码矩阵
+    """
+    # 初始化为全 -inf，形状 (mask_len, kv_cache_max_len)
+    mask = torch.full((mask_len, kv_cache_max_len), float('-inf'), dtype=torch.float32)
+
+    if actual_seq_len > 0:
+        # 有效查询长度：不超过实际序列长度
+        q_len = min(mask_len, actual_seq_len)
+        # 创建布尔下三角掩码，表示允许关注的位置
+        # 形状 (q_len, actual_seq_len)，下三角（含对角线）为 True
+        allow_positions = torch.tril(torch.ones(q_len, actual_seq_len, dtype=torch.bool))
+        # 将允许的位置设为 0（注意力分数加 0 不变）
+        mask[:q_len, :actual_seq_len][allow_positions] = 0
+
+    # 增加 batch 和 head 维度
+    mask = mask.unsqueeze(0).unsqueeze(0)
+    return mask
+
+
+def visualize_mask(mask, actual_seq_len, title="Causal Mask Visualization"):
+    """
+    可视化掩码矩阵
+
+    Args:
+        mask: 掩码矩阵 [1, 1, mask_len, kv_cache_max_len]
+        actual_seq_len: 真实序列长度
+        title: 图表标题
+    """
+    # 提取矩阵（去掉批次和头维度）
+    mask_2d = mask[0, 0].numpy()
+    #
+    # # 创建图形
+    # fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    #
+    # # 1. 完整矩阵可视化
+    # im1 = axes[0].imshow(mask_2d, cmap='viridis', aspect='auto')
+    # axes[0].set_title(f'{title}\n完整矩阵 (形状: {mask_2d.shape})')
+    # axes[0].set_xlabel('KV Cache位置')
+    # axes[0].set_ylabel('序列位置')
+    # plt.colorbar(im1, ax=axes[0])
+    #
+    # # 添加实际序列长度的标记
+    # if actual_seq_len > 0:
+    #     axes[0].axhline(y=actual_seq_len - 0.5, color='r', linestyle='--', alpha=0.7,
+    #                     label=f'实际序列长度={actual_seq_len}')
+    #     axes[0].axvline(x=actual_seq_len - 0.5, color='r', linestyle='--', alpha=0.7)
+    #     axes[0].legend()
+    #
+    # # 2. 只显示实际序列部分（前actual_seq_len行和列）
+    # if actual_seq_len > 0:
+    #     actual_part = mask_2d[:actual_seq_len, :actual_seq_len]
+    #     im2 = axes[1].imshow(actual_part, cmap='viridis', aspect='equal')
+    #     axes[1].set_title(f'实际序列部分 (形状: {actual_part.shape})')
+    #     axes[1].set_xlabel('序列位置 (列)')
+    #     axes[1].set_ylabel('序列位置 (行)')
+    #     plt.colorbar(im2, ax=axes[1])
+    #
+    #     # 添加网格线
+    #     axes[1].grid(True, alpha=0.3)
+    #
+    # plt.tight_layout()
+    # plt.show()
+
+    # 打印矩阵的数值信息
+    print(f"\n掩码矩阵统计信息:")
+    print(f"形状: {mask.shape}")
+    print(f"实际序列长度: {actual_seq_len}")
+    print(f"非-inf元素数量: {torch.sum(mask != float('-inf')).item()}")
+    print(f"0值元素数量: {torch.sum(mask == 0).item()}")
+    print(f"-inf元素数量: {torch.sum(mask == float('-inf')).item()}")
+
+    # 打印前几行和前几列的示例
+    print(f"\n矩阵前{actual_seq_len + 1}行前{actual_seq_len + 1}列示例:")
+    print(mask_2d[:actual_seq_len + 1, :actual_seq_len + 1])
 
 
 def build_and_convert_to_tflite_from_flags(

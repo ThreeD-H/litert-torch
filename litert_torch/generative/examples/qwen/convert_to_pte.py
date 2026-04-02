@@ -14,17 +14,17 @@
 # ==============================================================================
 
 """Example of converting Qwen 2.5 models to multi-signature tflite model."""
-
+import torch
+import transformers
 from absl import app
 from litert_torch.generative.examples.qwen import qwen
-from litert_torch.generative.tools.batch_convert import ExportConfig
 from litert_torch.generative.utilities import converter
 
 flags = converter.define_conversion_flags('qwen')
 
 _MODEL_SIZE = flags.DEFINE_enum(
     'model_size',
-    '3b',
+    '0.5b',
     ['0.5b', '1.5b', '3b'],
     'The size of the model to convert.',
 )
@@ -37,11 +37,9 @@ _BUILDER = {
 
 
 def main(_):
-    export_config = ExportConfig()
-    export_config.output_logits_on_prefill = True
-    export_config.mask_as_input = True
-    converter.build_and_convert_to_pte_from_flags(model_builder=_BUILDER[_MODEL_SIZE.value],
-                                                  export_config=export_config)
+    checkpoint_path = "/home/donghao/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775"
+    file_name = converter.build_and_convert_to_pte_from_flags(model_builder=_BUILDER[_MODEL_SIZE.value],
+                                                              checkpoint_path=checkpoint_path)
 
 
 if __name__ == '__main__':
